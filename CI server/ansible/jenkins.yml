@@ -1,0 +1,121 @@
+---
+- name: Configure Jenkins CI server
+  hosts: ci
+  become: true
+  vars:
+    jenkins_plugins:
+      - git
+      - workflow-aggregator
+      - github
+      - pipeline-stage-view
+      - credentials
+      - ssh-credentials
+      - matrix-auth
+
+  tasks:
+    - name: Update apt cache and upgrade system
+      apt:
+        update_cache: yes
+        upgrade: dist
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - openjdk-11-jdk
+          - wget
+          - gnupg
+          - apt-transport-https
+          - unzip
+        state: present
+        update_cache: yes
+
+    - name: Add Jenkins apt repository key
+      apt_key:
+        url: https://pkg.jenkins.io/debian-stable/jenkins.io.key
+        state: present
+
+    - name: Add Jenkins apt repository
+      apt_repository:
+        repo: "deb https://pkg.jenkins.io/debian-stable binary/"
+        state: present
+
+    - name: Install Jenkins
+      apt:
+        name: jenkins
+        state: present
+        update_cache: yes
+
+    - name: Ensure Jenkins service is enabled and started
+      service:
+        name: jenkins
+        state: started
+        enabled: yes
+
+    - name: Ensure jenkins group exists
+      group:
+        name: jenkins
+        state: present
+
+    - name: Add ubuntu user to jenkins group
+      user:
+        name: ubuntu
+        groups: jenkins
+        append: yes
+
+    - name: Create init.groovy.d directory
+      file:
+        path: /var/lib/jenkins/init.groovy.d
+        state: directory
+        owner: jenkins
+        group: jenkins
+        mode: "0755"
+
+    - name: Deploy groovy setup
+      copy:
+        dest: /var/lib/jenkins/init.groovy.d/basic-setup.groovy
+        owner: jenkins
+        group: jenkins
+        mode: "0644"
+        content: |
+          import jenkins.model.*
+          import hudson.security.*
+
+          def instance = Jenkins.getInstance()
+          def hudsonRealm = new HudsonPrivateSecurityRealm(false)
+          hudsonRealm.createAccount("admin","admin_password")
+          instance.setSecurityRealm(hudsonRealm)
+
+          def strategy = new GlobalMatrixAuthorizationStrategy()
+          strategy.add(Jenkins.ADMINISTER, "admin")
+          instance.setAuthorizationStrategy(strategy)
+
+          def pluginManager = instance.pluginManager
+          def updateCenter = instance.updateCenter
+          def plugins = ["git","workflow-aggregator","github","pipeline-stage-view","credentials","ssh-credentials","matrix-auth"]
+
+          plugins.each {
+            if (!pluginManager.getPlugin(it)) {
+              def deployment = updateCenter.getSite("default").getPlugin(it)
+              if (deployment) deployment.deploy()
+            }
+          }
+          instance.save()
+
+    - name: Restart Jenkins
+      service:
+        name: jenkins
+        state: restarted
+
+    - name: Show initial admin password
+      command: cat /var/lib/jenkins/secrets/initialAdminPassword
+      register: adminpw
+      changed_when: false
+
+    - name: Save password
+      copy:
+        dest: /home/ubuntu/jenkins_initial_admin_password.txt
+        content: "{{ adminpw.stdout }}\\n"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0600"

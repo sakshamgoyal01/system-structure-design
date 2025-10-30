@@ -1,0 +1,133 @@
+pipeline {
+  agent any
+
+  environment {
+    REGISTRY = "your-registry-url"
+    IMAGE = "yourapp"
+    COSIGN_KEY = credentials('cosign-key')
+    AWS_REGION = "ap-south-1"
+    PLAYSTORE_JSON = credentials('playstore-json')
+    ANDROID_KEYSTORE = credentials('android-keystore')
+    GITHUB_TOKEN = credentials('github-token')
+  }
+
+  stages {
+
+    stage('Checkout Code') {
+      steps {
+        echo "📦 Checking out repository..."
+        checkout scm
+      }
+    }
+
+    stage('Static Analysis & SBOM') {
+      steps {
+        echo "🔍 Running SAST and SBOM generation..."
+        sh '''
+          pip install semgrep
+          semgrep --config auto .
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          syft . -o json > sbom.json
+        '''
+      }
+    }
+
+    stage('Unit / Integration Tests') {
+      steps {
+        echo "🧪 Running tests..."
+        sh '''
+          pytest tests/ --disable-warnings
+        '''
+      }
+    }
+
+    stage('Docker Build & Sign') {
+      steps {
+        echo "🐳 Building and signing Docker image..."
+        sh '''
+          docker build -t $IMAGE:latest .
+          curl -sSL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o /usr/local/bin/cosign
+          chmod +x /usr/local/bin/cosign
+          cosign sign --key env://COSIGN_KEY $IMAGE:latest
+        '''
+      }
+    }
+
+    stage('Push to Registry') {
+      steps {
+        echo "☁️ Pushing image to registry..."
+        sh '''
+          echo "$GITHUB_TOKEN" | docker login ghcr.io -u yourusername --password-stdin
+          docker tag $IMAGE:latest $REGISTRY/$IMAGE:latest
+          docker push $REGISTRY/$IMAGE:latest
+        '''
+      }
+    }
+
+    stage('Mobile Build (Flutter / iOS)') {
+      agent { label 'macos' } // or use 'flutter-agent' if configured
+      steps {
+        echo "📱 Building Flutter mobile apps..."
+        sh '''
+          git clone https://github.com/flutter/flutter.git -b stable
+          export PATH="$PATH:`pwd`/flutter/bin"
+          flutter doctor
+          flutter pub get
+          flutter build apk --release
+          flutter build ipa --release
+        '''
+      }
+    }
+
+    stage('Mobile Code Signing') {
+      steps {
+        echo "🔏 Signing mobile artifacts..."
+        sh '''
+          jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
+            -keystore $ANDROID_KEYSTORE \
+            build/app/outputs/flutter-apk/app-release.apk myalias
+        '''
+      }
+    }
+
+    stage('Publish to App Stores') {
+      steps {
+        echo "🚀 Publishing to Google Play Store..."
+        sh '''
+          gem install fastlane
+          fastlane supply \
+            --json_key $PLAYSTORE_JSON \
+            --package_name com.example.app \
+            --apk build/app/outputs/flutter-apk/app-release.apk \
+            --track production
+        '''
+      }
+    }
+
+    stage('Security Scans & Artifact Sync (Global Control Plane)') {
+      steps {
+        echo "🌐 Running Trivy scan and syncing artifacts to global control plane..."
+        sh '''
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+          trivy image --format json --output trivy-report.json $REGISTRY/$IMAGE:latest
+          # Upload artifacts and scan reports to centralized registry
+          curl -X POST -F "file=@sbom.json" https://control-plane/api/v1/artifacts
+          curl -X POST -F "file=@trivy-report.json" https://control-plane/api/v1/vuln-reports
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      echo "📊 Archiving reports..."
+      archiveArtifacts artifacts: '*.json', fingerprint: true
+    }
+    success {
+      echo "✅ CI Mobile Artifact pipeline completed successfully!"
+    }
+    failure {
+      echo "❌ Build failed — Check logs for more info!"
+    }
+  }
+}
